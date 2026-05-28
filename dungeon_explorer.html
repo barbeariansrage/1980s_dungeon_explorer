@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>1980s Dungeon Explorer</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #07090d;
+      color: #c7d2ff;
+      font-family: "Courier New", Courier, monospace;
+      overflow: hidden;
+    }
+    #game {
+      display: grid;
+      grid-template-columns: auto;
+      gap: 1rem;
+      padding: 1rem;
+      background: radial-gradient(circle at top, #151b2f, #02040b 80%);
+      box-shadow: 0 0 40px rgba(80, 125, 255, 0.25);
+      border: 2px solid #5f75ff;
+      border-radius: 16px;
+      width: min(100vw - 2rem, 920px);
+    }
+    #board {
+      line-height: 1.05;
+      font-size: 14px;
+      white-space: pre;
+      background: #03050a;
+      padding: 12px;
+      border-radius: 10px;
+      border: 1px solid #3b4a71;
+      min-width: 880px;
+      overflow: auto;
+    }
+    .tile {
+      font-family: "Courier New", Courier, monospace;
+    }
+    .wall { color: #7f7d7a; }
+    .ground { color: #99a2c8; }
+    .player { color: #f5f77a; background: rgba(255,255,255,.05); }
+    .goblin { color: #8ce56b; }
+    .blob { color: #ff7a7a; }
+    .snake { color: #a2e4ff; }
+    .key { color: #ffd76f; }
+    .gate { color: #8a6cfd; }
+    .potion { color: #ff9bff; }
+    .status {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 1rem;
+      color: #c3d0ff;
+    }
+    .status div {
+      padding: 0.75rem 1rem;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(130,150,255,0.2);
+      border-radius: 10px;
+    }
+    .status strong { color: #ffffff; }
+    #message {
+      min-height: 32px;
+      color: #b8d4ff;
+    }
+    .footer {
+      font-size: 0.9rem;
+      color: #95a0c1;
+      line-height: 1.5;
+    }
+    .highlight { color: #ffdd70; }
+    button { display:none; }
+    #overlay {
+      display: none;
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0,0,0,0.8);
+      color: red;
+      font-size: 48px;
+      text-align: center;
+      line-height: 50vh;
+      z-index: 10;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+    }
+    #overlay-main {
+      font-size: 48px;
+      margin-bottom: 20px;
+    }
+    #overlay-sub {
+      font-size: 24px;
+      color: #c7d2ff;
+    }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <div id="overlay-main"></div>
+    <div id="overlay-sub"></div>
+  </div>
+  <div id="game">
+    <div class="status">
+      <div><strong>HP</strong>: <span id="hp">10</span> / 10</div>
+      <div><strong>Potions</strong>: <span id="potions">0</span></div>
+      <div><strong>Key</strong>: <span id="hasKey">No</span></div>
+      <div><strong>Enemies</strong>: <span id="enemyCount">0</span></div>
+    </div>
+    <div id="board" aria-live="polite"></div>
+    <div id="message"></div>
+    <div class="footer">
+      <div>Use <span class="highlight">arrow keys</span> to move, <span class="highlight">space</span> to swing, and <span class="highlight">F</span> to drink a potion.</div>
+      <div>Find the key <span class="highlight">P</span> and bring it onto the gate <span class="highlight">H</span>.</div>
+    </div>
+  </div>
+  <audio id="sfx" src=""></audio>
+  <script>
+    const rows = 26;
+    const cols = 70;
+    const map = [];
+    const directions = { ArrowUp: [ -1, 0 ], ArrowDown: [ 1, 0 ], ArrowLeft: [ 0, -1 ], ArrowRight: [ 0, 1 ] };
+    const tileChars = { wall: '#', floor: '.', player: '8', goblin: 'G', blob: 'O', snake: 'S', key:'P', gate:'H', potion:'+' };
+    const colors = { wall:'wall', floor:'ground', player:'player', goblin:'goblin', blob:'blob', snake:'snake', key:'key', gate:'gate', potion:'potion' };
+
+    let player = { r: 12, c: 6, hp: 10, potions: 0, hasKey:false, lastDir: [0,1] };
+    let entities = [];
+    let items = [];
+    let keysDown = {};
+    let message = '';
+    let gameOver = false;
+    let lastMoveTime = 0;
+    let frame = 0;
+    const boardElem = document.getElementById('board');
+    const hpElem = document.getElementById('hp');
+    const potionsElem = document.getElementById('potions');
+    const hasKeyElem = document.getElementById('hasKey');
+    const enemyCountElem = document.getElementById('enemyCount');
+    const messageElem = document.getElementById('message');
+
+    function playTone(freq, duration, type='square') {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = type;
+      osc.frequency.value = freq;
+      gain.gain.value = 0.05;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + duration / 1000);
+      osc.onended = () => ctx.close();
+    }
+
+    function buildDungeon() {
+      for (let r = 0; r < rows; r++) {
+        map[r] = Array(cols).fill('#');
+      }
+      for (let r = 1; r < rows - 1; r++) {
+        for (let c = 1; c < cols - 1; c++) {
+          map[r][c] = '.';
+        }
+      }
+      for (let c = 0; c < cols; c++) {
+        map[0][c] = '#';
+        map[rows - 1][c] = '#';
+      }
+      for (let r = 0; r < rows; r++) {
+        map[r][0] = '#';
+        map[r][cols - 1] = '#';
+      }
+      const horizontalRows = [5, 10, 15, 20];
+      horizontalRows.forEach((r, index) => {
+        for (let c = 3; c < cols - 3; c++) {
+          map[r][c] = '#';
+        }
+        const gaps = [8, 18, 28, 40, 52, 62];
+        gaps.forEach(c => map[r][c] = '.');
+        if (index % 2 === 0) map[r][14] = '.';
+      });
+      const verticalCols = [10, 18, 30, 42, 54];
+      verticalCols.forEach((c, index) => {
+        for (let r = 3; r < rows - 3; r++) {
+          map[r][c] = '#';
+        }
+        const gaps = [6, 12, 17, 22];
+        gaps.forEach(r => map[r][c] = '.');
+        if (index % 2 === 1) map[rows - 5][c] = '.';
+      });
+      const blocks = [
+        {r:4,c:26}, {r:8,c:50}, {r:14,c:14}, {r:17,c:36}, {r:7,c:58}
+      ];
+      blocks.forEach(block => {
+        for (let dr = 0; dr < 3; dr++) {
+          for (let dc = 0; dc < 4; dc++) {
+            map[block.r + dr][block.c + dc] = '#';
+          }
+        }
+      });
+      map[2][2] = '.';
+      map[rows - 3][cols - 3] = '.';
+      map[3][cols - 5] = '.';
+      placeItems();
+      placeGateAndKey();
+      placeEntities();
+    }
+
+    function placeItems() {
+      items = [];
+      // Random potion positions
+      for (let i = 0; i < 3; i++) {
+        let r, c;
+        do {
+          r = Math.floor(Math.random() * (rows - 2)) + 1;
+          c = Math.floor(Math.random() * (cols - 2)) + 1;
+        } while (map[r][c] !== '.' || entityAt(r, c) || itemAt(r, c));
+        items.push({r, c, type:'potion'});
+      }
+      // Random key position
+      let r, c;
+      do {
+        r = Math.floor(Math.random() * (rows - 2)) + 1;
+        c = Math.floor(Math.random() * (cols - 2)) + 1;
+      } while (map[r][c] !== '.' || entityAt(r, c) || itemAt(r, c));
+      items.push({r, c, type:'key'});
+    }
+
+    function placeGateAndKey() {
+      // Random gate position
+      let r, c;
+      do {
+        r = Math.floor(Math.random() * (rows - 2)) + 1;
+        c = Math.floor(Math.random() * (cols - 2)) + 1;
+      } while (map[r][c] !== '.' || entityAt(r, c) || itemAt(r, c));
+      map[r][c] = 'H';
+      player.r = 12;
+      player.c = 6;
+    }
+
+    function placeEntities() {
+      entities = [];
+      const enemyConfigs = [
+        { type: 'goblin', hp: 6, count: 2 },
+        { type: 'blob', hp: 4, count: 6 },
+        { type: 'snake', hp: 2, count: 10 }
+      ];
+      enemyConfigs.forEach(config => {
+        for (let i = 0; i < config.count; i++) {
+          let r, c;
+          do {
+            r = Math.floor(Math.random() * (rows - 2)) + 1;
+            c = Math.floor(Math.random() * (cols - 2)) + 1;
+          } while (map[r][c] !== '.' || entityAt(r, c) || itemAt(r, c));
+          addEntity(r, c, config.type, config.hp);
+        }
+      });
+    }
+
+    function addEntity(r,c,type,hp) {
+      entities.push({r,c,type,hp,delay: 0});
+    }
+
+    function drawBoard() {
+      let output = '';
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          let ch = map[r][c];
+          let css = colors.floor;
+          if (ch === '#') css = colors.wall;
+          else if (ch === 'H') css = colors.gate;
+          else if (ch === '.') css = colors.floor;
+          let entity = entities.find(e => e.r === r && e.c === c);
+          const item = items.find(i => i.r === r && i.c === c);
+          if (player.r === r && player.c === c) {
+            ch = tileChars.player;
+            css = colors.player;
+          } else if (entity) {
+            ch = tileChars[entity.type];
+            css = colors[entity.type];
+          } else if (item) {
+            if (item.type === 'potion') { ch = tileChars.potion; css = colors.potion; }
+            else if (item.type === 'key') { ch = tileChars.key; css = colors.key; }
+          }
+          output += `<span class=\"tile ${css}\">${ch}</span>`;
+        }
+        output += '\n';
+      }
+      boardElem.innerHTML = output;
+    }
+
+    function canWalk(r,c) {
+      if (r < 0 || r >= rows || c < 0 || c >= cols) return false;
+      const tile = map[r][c];
+      return tile !== '#';
+    }
+
+    function entityAt(r,c) {
+      return entities.find(e => e.r === r && e.c === c);
+    }
+
+    function itemAt(r,c) {
+      return items.find(i => i.r === r && i.c === c);
+    }
+
+    function removeItemAt(r,c) {
+      items = items.filter(i => !(i.r === r && i.c === c));
+    }
+
+    function updateStatus() {
+      hpElem.textContent = player.hp;
+      potionsElem.textContent = player.potions;
+      hasKeyElem.textContent = player.hasKey ? 'Yes' : 'No';
+      enemyCountElem.textContent = entities.length;
+      messageElem.textContent = message;
+    }
+
+    function collectItem() {
+      const item = itemAt(player.r, player.c);
+      if (!item) return;
+      if (item.type === 'potion') {
+        player.potions = Math.min(3, player.potions + 1);
+        message = 'Picked up a potion!';
+        playTone(440, 100, 'triangle');
+      } else if (item.type === 'key') {
+        player.hasKey = true;
+        message = 'You have the key! Bring it to the gate.';
+        playTone(820, 130, 'square');
+      }
+      removeItemAt(player.r, player.c);
+    }
+
+    function handlePlayerMove(dr,dc) {
+      const newR = player.r + dr;
+      const newC = player.c + dc;
+      if (!canWalk(newR, newC)) return;
+      if (entityAt(newR,newC)) return;
+      player.r = newR;
+      player.c = newC;
+      player.lastDir = [dr, dc];
+      collectItem();
+      if (player.hasKey && map[player.r][player.c] === 'H') {
+        message = 'You carried the key through the gate. Victory!';
+        gameWin();
+        return;
+      }
+      enemyTurn();
+      updateStatus();
+      drawBoard();
+    }
+
+    function attack() {
+      const [dr,dc] = player.lastDir;
+      if (dr === 0 && dc === 0) return;
+      const targetR = player.r + dr;
+      const targetC = player.c + dc;
+      const victim = entityAt(targetR, targetC);
+      if (victim) {
+        victim.hp -= 2;
+        message = `You slashed the ${victim.type} for 2 HP!`; 
+        playTone(1000, 120, 'sawtooth');
+        if (victim.hp <= 0) {
+          entities = entities.filter(e => e !== victim);
+          message += ' It died!';
+        }
+        enemyTurn();
+      } else {
+        message = 'You swing the sword and hit nothing.';
+        playTone(280, 80, 'triangle');
+        enemyTurn();
+      }
+      updateStatus();
+      drawBoard();
+    }
+
+    function drinkPotion() {
+      if (player.potions <= 0) {
+        message = 'No potions left.';
+        playTone(150, 100, 'sine');
+        return;
+      }
+      player.potions -= 1;
+      player.hp = Math.min(10, player.hp + 5);
+      message = 'You drink a potion and feel better.';
+      playTone(620, 130, 'triangle');
+    }
+
+    function enemyTurn() {
+      entities.forEach(entity => {
+        const dist = Math.abs(entity.r - player.r) + Math.abs(entity.c - player.c);
+        const active = dist <= 5;
+        if (!active) {
+          slowPatrol(entity);
+        } else {
+          chaseAndAttack(entity);
+        }
+      });
+    }
+
+    function slowPatrol(entity) {
+      const directionsList = [ [0,1],[0,-1],[1,0],[-1,0] ];
+      if (!entity.dir || Math.random() < 0.25) {
+        entity.dir = directionsList[Math.floor(Math.random() * directionsList.length)];
+      }
+      if (!tryMoveEntity(entity, entity.dir[0], entity.dir[1])) {
+        const shuffled = directionsList.slice().sort(() => Math.random() - 0.5);
+        for (const [dr, dc] of shuffled) {
+          if (tryMoveEntity(entity, dr, dc)) {
+            entity.dir = [dr, dc];
+            break;
+          }
+        }
+      }
+    }
+
+    function chaseAndAttack(entity) {
+      const distance = Math.abs(entity.r - player.r) + Math.abs(entity.c - player.c);
+      if (distance === 1) {
+        player.hp -= 2;
+        message = `The ${entity.type} strikes you for 2 HP!`;
+        playTone(220, 120, 'square');
+        if (player.hp <= 0) gameLose();
+      } else {
+        const dr = Math.sign(player.r - entity.r);
+        const dc = Math.sign(player.c - entity.c);
+        const primary = Math.random() < 0.5 ? [dr, 0] : [0, dc];
+        const secondary = primary[0] === 0 ? [dr, 0] : [0, dc];
+        if (!tryMoveEntity(entity, primary[0], primary[1])) {
+          tryMoveEntity(entity, secondary[0], secondary[1]);
+        }
+      }
+    }
+
+    function tryMoveEntity(entity, dr, dc) {
+      if (dr === 0 && dc === 0) return false;
+      const nr = entity.r + dr;
+      const nc = entity.c + dc;
+      if (!canWalk(nr,nc)) return false;
+      if (entityAt(nr,nc)) return false;
+      if (player.r === nr && player.c === nc) return false;
+      entity.r = nr;
+      entity.c = nc;
+      return true;
+    }
+
+    function gameWin() {
+      gameOver = true;
+      playTone(1200, 250, 'triangle');
+      const overlay = document.getElementById('overlay');
+      const main = document.getElementById('overlay-main');
+      const sub = document.getElementById('overlay-sub');
+      main.textContent = 'YOU WIN';
+      main.style.color = 'gold';
+      sub.textContent = 'Press R to restart with new locations';
+      overlay.style.display = 'flex';
+    }
+
+    function gameLose() {
+      gameOver = true;
+      playTone(110, 400, 'sine');
+      const overlay = document.getElementById('overlay');
+      const main = document.getElementById('overlay-main');
+      const sub = document.getElementById('overlay-sub');
+      main.textContent = 'YOU DIED';
+      main.style.color = 'red';
+      sub.textContent = 'Press R to restart';
+      overlay.style.display = 'flex';
+    }
+
+    function resetGame() {
+      player = { r: 12, c: 6, hp: 10, potions: 0, hasKey:false, lastDir: [0,1] };
+      entities = [];
+      items = [];
+      keysDown = {};
+      message = '';
+      gameOver = false;
+      lastMoveTime = 0;
+      frame = 0;
+      document.getElementById('overlay').style.display = 'none';
+      buildDungeon();
+      updateStatus();
+      drawBoard();
+      requestAnimationFrame(update);
+    }
+
+    window.addEventListener('keydown', e => {
+      if (gameOver && e.key.toLowerCase() !== 'r') return;
+      if (e.key in directions && !gameOver) {
+        const dir = directions[e.key];
+        handlePlayerMove(dir[0], dir[1]);
+        e.preventDefault();
+      }
+      if ((e.key === ' ' || e.code === 'Space') && !gameOver) {
+        attack();
+        e.preventDefault();
+      }
+      if (e.key.toLowerCase() === 'f' && !gameOver) {
+        drinkPotion();
+        updateStatus();
+        drawBoard();
+        enemyTurn();
+        updateStatus();
+        drawBoard();
+        e.preventDefault();
+      }
+      if (e.key.toLowerCase() === 'r') {
+        resetGame();
+        e.preventDefault();
+      }
+    });
+
+    buildDungeon();
+    updateStatus();
+    drawBoard();
+  </script>
+</body>
+</html>
